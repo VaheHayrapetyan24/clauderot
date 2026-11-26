@@ -13,7 +13,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 
 const HOME = process.env.CLAUDEROT_HOME || path.join(os.homedir(), '.clauderot');
 const STATE = path.join(HOME, 'state.json');
@@ -23,6 +23,8 @@ const PORT = Number(process.env.CLAUDEROT_PORT || 9877);
 const DELAY = Number(process.env.CLAUDEROT_DELAY ?? 3); // seconds before the window appears
 const ON_STOP = process.env.CLAUDEROT_ON_STOP || 'pause'; // pause | close
 const URL = process.env.CLAUDEROT_URL || 'https://www.youtube.com/shorts';
+const POSITION = process.env.CLAUDEROT_POSITION || 'near'; // near | off
+const SIZE = { width: 440, height: 820 };
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -153,7 +155,71 @@ function findBrowser() {
   return null;
 }
 
-function launchBrowser() {
+// ---------- placing the window next to Claude Code ----------
+// Linux/X11 only for now: reads the focused window (the Claude Code window,
+// since you just typed a prompt there) with xprop/xwininfo and the monitor
+// layout with xrandr. Anywhere else it returns null and the OS decides.
+const run = (cmd, args) =>
+  execFileSync(cmd, args, { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+
+function activeWindowBounds() {
+  if (POSITION === 'off' || process.platform !== 'linux' || !process.env.DISPLAY || process.env.WAYLAND_DISPLAY) return null;
+  try {
+    const id = run('xprop', ['-root', '_NET_ACTIVE_WINDOW']).match(/0x[0-9a-f]+/i)?.[0];
+    if (!id || /^0x0+$/.test(id)) return null;
+    if (/youtube\.com/.test(run('xprop', ['-id', id, 'WM_CLASS']))) return null; // that's the player itself
+    const info = run('xwininfo', ['-id', id]);
+    const num = (k) => Number(info.match(new RegExp(`${k}:\\s*(-?\\d+)`))?.[1]);
+    const b = { x: num('Absolute upper-left X'), y: num('Absolute upper-left Y'), w: num('Width'), h: num('Height') };
+    return Object.values(b).every(Number.isFinite) ? b : null;
+  } catch { return null; }
+}
+
+function monitors() {
+  try {
+    return [...run('xrandr', ['--listmonitors']).matchAll(/(\d+)\/\d+x(\d+)\/\d+\+(-?\d+)\+(-?\d+)/g)]
+      .map((m) => ({ w: +m[1], h: +m[2], x: +m[3], y: +m[4] }));
+  } catch { return []; }
+}
+
+const contains = (m, x, y) => x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h;
+
+// Where the player should go: beside the Claude window on the same monitor,
+// right side first, then left, else tucked into the monitor's right edge.
+function targetBounds() {
+  const win = activeWindowBounds();
+  if (!win) return null;
+  const mon = monitors().find((m) => contains(m, win.x + win.w / 2, win.y + win.h / 2)) || win;
+  const gap = 8;
+  const width = SIZE.width;
+  const height = Math.min(SIZE.height, mon.h - 2 * gap);
+  let left;
+  if (win.x + win.w + gap + width <= mon.x + mon.w) left = win.x + win.w + gap;
+  else if (win.x - gap - width >= mon.x) left = win.x - gap - width;
+  else left = mon.x + mon.w - width - gap;
+  const top = Math.max(mon.y + gap, Math.min(win.y, mon.y + mon.h - height - gap));
+  return { left, top, width, height, mon: { x: mon.x, y: mon.y, w: mon.w, h: mon.h } };
+}
+
+// Move an already-open player only if it's on a different monitor than
+// Claude, so a spot you dragged it to yourself is kept.
+async function moveNear(page, target) {
+  if (!target) return;
+  const { webSocketDebuggerUrl } = await getJSON('/json/version');
+  const c = await cdp(webSocketDebuggerUrl);
+  try {
+    const r = (await c.send('Browser.getWindowForTarget', { targetId: page.id })).result;
+    if (!r?.windowId || !r.bounds) return;
+    const b = r.bounds;
+    if (b.windowState === 'normal' && contains(target.mon, b.left + b.width / 2, b.top + b.height / 2)) return;
+    if (b.windowState !== 'normal') await c.send('Browser.setWindowBounds', { windowId: r.windowId, bounds: { windowState: 'normal' } });
+    const { left, top, width, height } = target;
+    await c.send('Browser.setWindowBounds', { windowId: r.windowId, bounds: { left, top, width, height } });
+    log('moved', left, top);
+  } finally { c.close(); }
+}
+
+function launchBrowser(target) {
   const bin = findBrowser();
   if (!bin) { log('no Chrome/Chromium found; set CLAUDEROT_BROWSER'); return false; }
   const child = spawn(bin, [
@@ -161,7 +227,8 @@ function launchBrowser() {
     `--user-data-dir=${PROFILE}`,
     '--no-first-run', '--no-default-browser-check',
     '--autoplay-policy=no-user-gesture-required',
-    '--window-size=440,820',
+    `--window-size=${target?.width ?? SIZE.width},${target?.height ?? SIZE.height}`,
+    ...(target ? [`--window-position=${target.left},${target.top}`] : []),
     `--app=${URL}`,
   ], { detached: true, stdio: 'ignore' });
   child.unref();
@@ -184,9 +251,9 @@ async function ensureInjected(page) {
 }
 
 // ---------- commands ----------
-async function show() {
+async function show(target = null) {
   if (!(await browserUp())) {
-    if (!launchBrowser()) return;
+    if (!launchBrowser(target)) return;
     for (let i = 0; i < 60 && !(await browserUp()); i++) await sleep(250);
   }
   let page;
@@ -197,6 +264,7 @@ async function show() {
     await sleep(250);
   }
   if (!page) { log('youtube page never appeared'); return; }
+  await moveNear(page, target).catch((e) => log('move failed', e.message));
   const r = await ensureInjected(page);
   await evalIn(page, 'window.__clauderot.resume()');
   await getJSON(`/json/activate/${page.id}`).catch(() => {});
@@ -204,11 +272,13 @@ async function show() {
 }
 
 async function worker(token) {
+  // Read where Claude is right away, while its window still has focus.
+  const target = targetBounds();
   await sleep(DELAY * 1000);
   const s = readState();
   // Claude already finished, is waiting on you, or a newer prompt took over.
   if (!s.busy || s.awaiting || s.token !== token || fs.existsSync(DISABLED)) return;
-  await show();
+  await show(target);
 }
 
 // PostToolUse: runs after every tool call, so it must be cheap. It only acts
@@ -267,7 +337,8 @@ async function main() {
       return;
     }
     case '_worker': return worker(arg);
-    case 'show': return show();
+    case 'show': return show(targetBounds());
+    case 'where': return console.log(JSON.stringify({ claude: activeWindowBounds(), player: targetBounds() }));
     case 'stop': return stop(arg);
     case 'resume': return resume();
     case 'close': await close(); return console.log('clauderot: player closed');
@@ -276,7 +347,7 @@ async function main() {
     case 'status':
       return console.log(`clauderot: ${fs.existsSync(DISABLED) ? 'disabled' : 'enabled'}, ` +
         `player ${(await browserUp()) ? 'open' : 'closed'}, claude ${readState().busy ? 'working' : 'idle'}`);
-    default: console.log('usage: clauderot.js start|stop|on|off|close|status');
+    default: console.log('usage: clauderot.js start|stop|on|off|close|status|where');
   }
 }
 
