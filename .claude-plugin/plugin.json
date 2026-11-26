@@ -1,0 +1,7 @@
+{
+  "name": "clauderot",
+  "version": "0.1.0",
+  "description": "Plays YouTube Shorts in a side browser window while Claude works, auto-scrolls when each short ends, and pauses when Claude is done or needs you.",
+  "author": { "name": "vahe" },
+  "keywords": ["youtube", "shorts", "fun", "hooks"]
+}

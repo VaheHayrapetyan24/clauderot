@@ -1,0 +1,11 @@
+{
+  "name": "clauderot",
+  "owner": { "name": "vahe" },
+  "plugins": [
+    {
+      "name": "clauderot",
+      "source": "./",
+      "description": "YouTube Shorts while Claude works."
+    }
+  ]
+}
